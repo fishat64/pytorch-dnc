@@ -8,12 +8,15 @@ import torch.nn.functional as F
 import numpy as np
 
 from .util import *
+from .debugger import CustomDataCollector
 
 
 class Memory(nn.Module):
 
   def __init__(self, input_size, mem_size=512, cell_size=32, read_heads=4, gpu_id=-1, independent_linears=True):
     super(Memory, self).__init__()
+
+    self.cdc = CustomDataCollector()
 
     self.mem_size = mem_size
     self.cell_size = cell_size
@@ -255,6 +258,21 @@ class Memory(nn.Module):
       write_gate = T.sigmoid(ξ[:, r * w + 2 * r + 3 * w + 2].contiguous()).unsqueeze(1).view(b, 1)
       # read modes (b * 3*r)
       read_modes = σ(ξ[:, r * w + 2 * r + 3 * w + 3: r * w + 5 * r + 3 * w + 3].contiguous().view(b, r, 3), -1)
+
+    self.cdc.save("write_key", write_key)
+    self.cdc.save("write_vector", write_vector)
+    self.cdc.save("erase_vector", erase_vector)
+    self.cdc.save("free_gates", free_gates)
+    self.cdc.save("read_keys", read_keys)
+    self.cdc.save("read_strengths", read_strengths)
+    self.cdc.save("write_strength", write_strength)
+    self.cdc.save("write_gate", write_gate)
+    self.cdc.save("allocation_gate", allocation_gate)
+    self.cdc.save("read_modes", read_modes)
+
+    #self.cdc.print("write_key", n=3)
+    #self.cdc.print("read_keys", n=3)
+    #self.cdc.print("read_modes", n=3)
 
     hidden = self.write(write_key, write_vector, erase_vector, free_gates,
                         read_strengths, write_strength, write_gate, allocation_gate, hidden)
