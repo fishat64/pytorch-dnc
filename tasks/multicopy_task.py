@@ -75,12 +75,13 @@ def llprint(message):
   sys.stdout.flush()
 
 def debprint(*args):
-  DEBUG = False
+  DEBUG = True
   if DEBUG:
     print(*args)
 
 
 def generate_data(batch_size, length, size, cuda=-1, maxnumberofcopies=3):
+  
   
   debprint("length:", length, "size:", size)
   
@@ -125,9 +126,9 @@ if __name__ == '__main__':
   if not os.path.isdir(ckpts_dir):
     os.mkdir(ckpts_dir)
 
-  batch_size = 100
+  batch_size = 1
   sequence_max_length = 8
-  iterations = 10000
+  iterations = 500
   summarize_freq = 100
   check_freq = 100
   curriculum_freq = 1000
@@ -276,20 +277,22 @@ if __name__ == '__main__':
       T.save(cur_weights, check_ptr)
       llprint("Done!\n")
 
-  for i in range(int((iterations + 1) / 10)):
+  for i in range(10):#range(int((iterations + 1) / 100)):
     llprint("\nIteration %d/%d" % (i, iterations))
     # We test now the learned generalization using sequence_max_length examples
-    random_length = np.random.randint(2, sequence_max_length * 10 + 1)
-    input_data, target_output, loss_weights = generate_data(10, random_length, input_size)
+    random_length = np.random.randint(2, sequence_max_length + 1)
+    input_data, target_output = generate_data(100, random_length, input_length, -1, maxnumberofcopies=maxnumberofcopies)
 
     if rnn.debug:
       output, (chx, mhx, rv), v = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
     else:
       output, (chx, mhx, rv) = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
 
-    output = output[:, -1, :].sum().data.cpu().numpy()[0]
+    print(torch.flatten(torch.round(output[0], decimals=0)), torch.flatten(target_output[0]))
+    output = output[:, -1, :].sum().data.cpu().numpy()
     target_output = target_output.sum().data.cpu().numpy()
 
+    
     try:
       print("\nReal value: ", ' = ' + str(int(target_output[0])))
       print("Predicted:  ", ' = ' + str(int(output // 1)) + " [" + str(output) + "]")
