@@ -12,6 +12,9 @@ import math
 import time
 import argparse
 from visdom import Visdom
+from tqdm import tqdm
+import plotly.express as px
+import pandas as pd
 
 sys.path.insert(0, os.path.join('..', '..'))
 
@@ -26,6 +29,8 @@ from dnc.dnc import DNC
 from dnc.sdnc import SDNC
 from dnc.sam import SAM
 from dnc.util import *
+
+from dnc.lib import exp_loss, InputStorage, mse, criterion
 
 parser = argparse.ArgumentParser(description='PyTorch Differentiable Neural Computer')
 parser.add_argument('-input_size', type=int, default=6, help='dimension of input feature')
@@ -79,101 +84,83 @@ def debprint(*args):
   if DEBUG:
     print(*args)
 
+st = InputStorage()
 
-def generate_data(batch_size, length, size, cuda=-1, maxnumberofcopies=3):
-  
-  debprint("length:", length, "size:", size)
-  
-  numberOfCopies = np.random.randint(low=1, high=maxnumberofcopies)
 
-  #print("numberofcopies:", numberOfCopies)
+def generate_data(batch_size, length, maxlength, cuda=-1):
+  length = length + 0
 
-  input_data = np.zeros((batch_size, 2 * length + 1, size*maxnumberofcopies), dtype=np.float32)
-  target_output = np.zeros((batch_size, 2 * length + 1, size*maxnumberofcopies), dtype=np.float32)
+  input_data = np.zeros((batch_size, maxlength, maxlength), dtype=np.float32)
+  target_output = np.zeros((batch_size, maxlength, maxlength), dtype=np.float32)
 
-  numberlength = int(math.floor((size-1)/2))
-  sequence1 = np.random.binomial(1, 0.5, (batch_size, length, numberlength))
-  sequence2 = np.random.binomial(1, 0.5, (batch_size, length, numberlength))
 
-  print(numberlength)
-  print("sequence1:", sequence1.shape, sequence1)
-  print("sequence2:", sequence2.shape, sequence2)
+  sequence1 = np.random.binomial(1, 0.5, (batch_size, length, 1))
+  sequence2 = np.random.binomial(1, 0.5, (batch_size, length, 1))
 
-  print("input_data:", input_data[:, :length, 0:numberlength].shape)
+  input_data[:, 0:length, 0:1] = sequence1 #first sequence
+  input_data[:, length, 1] = 9  #pause
+  input_data[:, length+1:length*2+1, 2:3] = sequence2 #second sequence
 
-  input_data[:, :length, 0:numberlength] = sequence1
-  input_data[:, length, numberlength] = 9  #pause
-  input_data[:, :length, numberlength+1:(numberlength*2+1)] = sequence2
-
-  def calcsum(sequenceA, sequenceB):
-    sumsequence = np.zeros(sequenceA.shape)
+  def calcsum(sequenceA, sequenceB): #calculate sum of two binary numbers
+    sumsequence = np.zeros((batch_size, length + 1, length +1))
     assert len(sequenceA) == len(sequenceB)
     for k in range(len(sequenceA)):
-      for j in range(len(sequenceA[k])):
-        carry = 0
-        for i in reversed(range(len(sequenceA[k][j]))):
-            if sequenceA[k][j][i] == 1 and sequenceB[k][j][i] == 1:
-                sumsequence[k][j][i] = 0+carry
+      carry = 0 # carry bit
+      for j in reversed(range(len(sequenceA[k]))):
+            if sequenceA[k][j][0] == 1 and sequenceB[k][j][0] == 1:
+                sumsequence[k][j+1][-1] = 0+carry
                 carry = 1
-            elif (sequenceA[k][j][i] == 1 and sequenceB[k][j][i] == 0) or (sequenceA[k][j][i] == 0 and sequenceB[k][j][i] == 1):
+            elif (sequenceA[k][j][0] == 1 and sequenceB[k][j][0] == 0) or (sequenceA[k][j][0] == 0 and sequenceB[k][j][0] == 1):
                 if carry == 1:
-                    sumsequence[k][j][i] = 0
+                    sumsequence[k][j+1][-1] = 0
                     carry = 1
                 else:
-                    sumsequence[k][j][i] = 1
+                    sumsequence[k][j+1][-1] = 1
                     carry = 0
             else:
-                sumsequence[k][j][i] = 0+carry
+                sumsequence[k][j+1][-1] = 0+carry
                 carry = 0
+      sumsequence[k][0][-1] = carry
     return sumsequence
   
-    
-
-  target_output[:, length + 1:, 0:numberlength] = calcsum(sequence1, sequence2)
-
-  debprint("inputdata:", input_data.shape)
-  debprint("outpudtata:",target_output.shape)
-
-  input_data = T.from_numpy(input_data)
-  target_output = T.from_numpy(target_output)
-  if cuda != -1:
-    input_data = input_data.cuda()
-    target_output = target_output.cuda()
-
-  return var(input_data), var(target_output)
+  target_output[:, -(length+1):, -(length+1):] = calcsum(sequence1, sequence2) #write sum to target output
+  return input_data, target_output
 
 
-def criterion(predictions, targets):
-  return T.mean(
-      -1 * F.logsigmoid(predictions) * (targets) - T.log(1 - F.sigmoid(predictions) + 1e-9) * (1 - targets)
-  )
+
+
+def combLoss(prediction, target):
+  return exp_loss(prediction, target)
+
+
 
 if __name__ == '__main__':
+
+  datas = []
 
   dirname = os.path.dirname(__file__)
   ckpts_dir = os.path.join(dirname, 'checkpoints')
   if not os.path.isdir(ckpts_dir):
     os.mkdir(ckpts_dir)
 
-  batch_size = 100
-  sequence_max_length = 8
-  iterations = 10000
+  batch_size = 1
+  sequence_length = 3
+  sequence_max_length = 5
+  iterations = 500000 #200000
   summarize_freq = 100
   check_freq = 100
-  curriculum_freq = 1000
+  curriculum_freq = 2500
 
 
   # input_size = output_size = args.input_size
-  mem_slot = 8
-  mem_size = 10
-  read_heads = 1
+  mem_slot = 32
+  mem_size = 1
+  read_heads = 2
   curriculum_increment = 1
-
-  maxnumberofcopies=5
-
-  input_length = 6
-  input_size = input_length*maxnumberofcopies
+  input_size = 2*sequence_max_length + 1
   output_size = 64
+
+  replaceWithWrong = True
 
   debprint(input_size, output_size)
 
@@ -201,28 +188,53 @@ if __name__ == '__main__':
  
 
   (chx, mhx, rv) = (None, None, None)
-  for epoch in range(iterations + 1):
+  for epoch in tqdm(range(iterations + 1)):
     llprint("\rIteration {ep}/{tot}".format(ep=epoch, tot=iterations))
     optimizer.zero_grad()
 
-    random_length = np.random.randint(1, sequence_max_length + 1)
 
-    input_data, target_output = generate_data(batch_size, random_length, input_length, -1, maxnumberofcopies=maxnumberofcopies)
+    input_data, target_output = generate_data(batch_size, sequence_length, input_size, -1)
 
-    debprint(input_data.shape, target_output.shape)
+    if replaceWithWrong:
+      errordatList = st.getHighestErrorInputs(int(batch_size/16)+2)
+      for count, value in enumerate(errordatList):
+        if input_data[count].shape[0] != value["input"].shape[0]:
+          input_data[count] = np.zeros(input_data[count].shape, dtype=np.float32)
+          target_output[count] = np.zeros(target_output[count].shape, dtype=np.float32)
+          i = 0
+          offset = 1
+          while i < value["input"].shape[0]:
+            input_data[count][i+offset] = value["input"][i]
+            if value["input"][i] == 9:
+              offset = offset + 1
+            i = i+1
+          i = 0
+          offset = 2
+          while i < value["target"].shape[0]:
+            target_output[count][i+offset] = value["target"][i]
+            i = i+1
+          st.removeInputWithError(value["input"])
+        else:
+          input_data[count] = value["input"]
+          target_output[count] = value["target"]
+
+    input_data = var(T.from_numpy(input_data))
+    target_output = var(T.from_numpy(target_output))
+
 
     if rnn.debug:
       output, (chx, mhx, rv), v = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
     else:
       output, (chx, mhx, rv) = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
 
-    debprint(output.shape, target_output.shape)
 
-    print("input_data:", input_data[0, :, :].T)
-    print("target_output:", target_output[0, :, :].T)
-    print("output:", output[0, :, :].T)
+    for i in range(batch_size):
+      st.saveInputWithError(input_data[i].numpy(), target_output[i].numpy(), combLoss(output[i], target_output[i]).item())
 
-    loss = criterion((output), target_output)
+
+    loss = combLoss((output), target_output)
+
+    datas.append({"epoch": epoch, "loss": loss.item(), "sequencelength": sequence_length})
 
     loss.backward()
 
@@ -232,33 +244,24 @@ if __name__ == '__main__':
 
     summarize = (epoch % summarize_freq == 0)
     take_checkpoint = (epoch != 0) and (epoch % check_freq == 0)
-    increment_curriculum = (epoch != 0) and (epoch % curriculum_freq == 0)
+    
 
     # detach memory from graph
     mhx = { k : (v.detach() if isinstance(v, var) else v) for k, v in mhx.items() }
 
     last_save_losses.append(loss_value)
+    loss = np.mean(last_save_losses)
 
     if summarize:
-      loss = np.mean(last_save_losses)
-      # print(input_data)
-      # print("1111111111111111111111111111111111111111111111")
-      # print(target_output)
-      # print('2222222222222222222222222222222222222222222222')
-      # print(F.relu6(output))
-      llprint("\n\tAvg. Logistic Loss: %.4f\n" % (loss))
+      llprint("\n\tAvg. Loss: %.4f\n" % (loss))
       if np.isnan(loss):
         raise Exception('nan Loss')
+      print("CE Loss: ", str(mse(output, target_output).item()))
+      print("Log Loss: ", str(criterion(output, target_output).item()))
+      print("Exp Loss: ", str(exp_loss(output, target_output).item()))
+      print("\n")
 
     if summarize and rnn.debug:
-      print(v.keys())
-
-      loss = np.mean(last_save_losses)
-      # print(input_data)
-      # print("1111111111111111111111111111111111111111111111")
-      # print(target_output)
-      # print('2222222222222222222222222222222222222222222222')
-      # print(F.relu6(output))
       last_save_losses = []
 
       viz.heatmap(
@@ -295,9 +298,11 @@ if __name__ == '__main__':
       )
 
 
+    increment_curriculum = (epoch != 0) and (epoch % curriculum_freq == 0) and (sequence_length < sequence_max_length)
+
     if increment_curriculum:
-      sequence_max_length = sequence_max_length + curriculum_increment
-      print("Increasing max length to " + str(sequence_max_length))
+      sequence_length = sequence_length + curriculum_increment
+      print("Increasing max length to " + str(sequence_length))
 
     if take_checkpoint:
       llprint("\nSaving Checkpoint ... "),
@@ -306,11 +311,15 @@ if __name__ == '__main__':
       T.save(cur_weights, check_ptr)
       llprint("Done!\n")
 
+  df = pd.DataFrame(datas)
+  fig = px.scatter(df, x="epoch", y="loss", color="sequencelength", trendline="ols")
+  fig.show()
+
   for i in range(int((iterations + 1) / 10)):
     llprint("\nIteration %d/%d" % (i, iterations))
     # We test now the learned generalization using sequence_max_length examples
-    random_length = np.random.randint(2, sequence_max_length * 10 + 1)
-    input_data, target_output = generate_data(10, random_length, input_length, -1,  maxnumberofcopies=maxnumberofcopies)
+    random_length = np.random.randint(2, sequence_length  + 1)
+    input_data, target_output = generate_data(batch_size, random_length, 1, -1)
 
     if rnn.debug:
       output, (chx, mhx, rv), v = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
@@ -319,6 +328,19 @@ if __name__ == '__main__':
 
     output = output[:, -1, :].sum().data.cpu().numpy()[0]
     target_output = target_output.sum().data.cpu().numpy()
+
+    print("\n\n")
+    print("Input: ", torch.flatten(input_data[0]))
+    print("Output: ", torch.flatten(torch.round(output[0], decimals=1)))
+    print("Target: ", torch.flatten(target_output[0]))
+    print("CE Loss: ", str(mse(output[0], target_output[0]).item()))
+    print("Log Loss: ", str(criterion(output[0], target_output[0]).item()))
+    print("Exp Loss: ", str(exp_loss(output[0], target_output[0]).item()))
+    print("\n\n")
+    print("CE Loss: ", str(mse(output, target_output).item()))
+    print("Log Loss: ", str(criterion(output, target_output).item()))
+    print("Exp Loss: ", str(exp_loss(output, target_output).item()))
+    print("\n\n")
 
     try:
       print("\nReal value: ", ' = ' + str(int(target_output[0])))

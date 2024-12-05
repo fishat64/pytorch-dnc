@@ -13,6 +13,8 @@ import time
 import argparse
 from visdom import Visdom
 
+from tqdm import tqdm
+
 sys.path.insert(0, os.path.join('..', '..'))
 
 import torch as T
@@ -26,6 +28,8 @@ from dnc.dnc import DNC
 from dnc.sdnc import SDNC
 from dnc.sam import SAM
 from dnc.util import *
+
+from dnc.lib import *
 
 parser = argparse.ArgumentParser(description='PyTorch Differentiable Neural Computer')
 parser.add_argument('-input_size', type=int, default=6, help='dimension of input feature')
@@ -60,6 +64,10 @@ parser.add_argument('-visdom', action='store_true', help='plot memory content on
 args = parser.parse_args()
 print(args)
 
+
+st = InputStorage()
+
+
 viz = Visdom()
 # assert viz.check_connection()
 
@@ -75,32 +83,48 @@ def llprint(message):
   sys.stdout.flush()
 
 def debprint(*args):
-  DEBUG = True
+  DEBUG = False
   if DEBUG:
     print(*args)
 
 
-def generate_data(batch_size, length, size, cuda=-1, maxnumberofcopies=3):
+def generate_data(batch_size, length, size, cuda=-1, maxnumberofcopies=3, currentmaxnocopies=3, fillbatch=False):
+  length=length+1
+  size=1 # ignore size
   
-  
-  debprint("length:", length, "size:", size)
-  
-  numberOfCopies = np.random.randint(low=1, high=maxnumberofcopies)
+  numberOfCopies = np.random.randint(low=2, high=currentmaxnocopies, size=(batch_size, 1))
 
-  #print("numberofcopies:", numberOfCopies)
 
-  input_data = np.zeros((batch_size, 2 * length + 1, size*maxnumberofcopies), dtype=np.float32)
-  target_output = np.zeros((batch_size, 2 * length + 1, size*maxnumberofcopies), dtype=np.float32)
+  input_data = np.zeros((batch_size, length*maxnumberofcopies, size), dtype=np.float32)
+  target_output = np.zeros((batch_size, length*maxnumberofcopies, size), dtype=np.float32)
 
-  sequence = np.random.binomial(1, 0.5, (batch_size, length, size - 3))
+  sequence = np.random.binomial(1, 0.5, (batch_size, length-1, size))
 
-  input_data[:, :length, :size - 3] = sequence
-  input_data[:, length, -3] = 9  #pause
-  input_data[:, length, -2] = numberOfCopies
-  input_data[:, length, -1] = 9  # the end symbol
-  for i in range(numberOfCopies):
-    target_output[:, length + 1:, (i*size):((i+1)*size) - 3] = sequence
-    #print("to", target_output[:, length + 1:, (i*size):((i+1)*size) - 3], "toc", target_output[:, length + 1:, :])
+  for i in range(batch_size): # assure no empty sequences
+    while np.sum(sequence[i]) == 0:
+      sequence[i] = np.random.binomial(1, 0.5, (1, length-1, size))
+
+  if fillbatch:
+    seq = np.random.binomial(1, 0.5, (1, length-1, size))
+    while np.sum(seq) == 0:
+      seq = np.random.binomial(1, 0.5, (1, length-1, size))
+    noc =  np.random.randint(low=2, high=currentmaxnocopies)
+    for i in range(batch_size):
+      sequence[i] = seq
+      numberOfCopies[i] = noc
+
+
+
+  input_data[:, :length-1, :] = sequence
+  input_data[:, length-1, :] = 9  # the end symbol
+  input_data[:, -2, :] = 9
+  input_data[:, -1, :] = numberOfCopies  # the end symbol
+
+  for i in range(batch_size): # save input data to avoid intersection between train, test and validation data
+    st.saveInput(input_data[i])
+
+    for j in range(numberOfCopies[i][0]):
+      target_output[i, (j*length)-j:((j+1)*length) - (j+1), :] = sequence[i]
 
   debprint("inputdata:", input_data.shape)
   debprint("outpudtata:",target_output.shape)
@@ -114,11 +138,6 @@ def generate_data(batch_size, length, size, cuda=-1, maxnumberofcopies=3):
   return var(input_data), var(target_output)
 
 
-def criterion(predictions, targets):
-  return T.mean(
-      -1 * F.logsigmoid(predictions) * (targets) - T.log(1 - F.sigmoid(predictions) + 1e-9) * (1 - targets)
-  )
-
 if __name__ == '__main__':
 
   dirname = os.path.dirname(__file__)
@@ -126,24 +145,27 @@ if __name__ == '__main__':
   if not os.path.isdir(ckpts_dir):
     os.mkdir(ckpts_dir)
 
-  batch_size = 1
-  sequence_max_length = 8
-  iterations = 500
+  batch_size = 100
+  sequence_max_length = 3
+  iterations = 20000
   summarize_freq = 100
   check_freq = 100
-  curriculum_freq = 1000
+  curriculum_freq = 5000
+  curriculumMaxNoCopies_freq = 1000
 
 
   # input_size = output_size = args.input_size
-  mem_slot = 8
-  mem_size = 10
+  mem_slot = 16 # number of memory slots
+  mem_size = 1 # size of each memory slot
   read_heads = 1
   curriculum_increment = 1
 
-  maxnumberofcopies=5
+
+  maxnumberofcopies=6
+  currentmaxnocopies=3
 
   input_length = 6
-  input_size = input_length*maxnumberofcopies
+  input_size = 1#input_length*maxnumberofcopies #+10 memory = input
   output_size = 64
 
   debprint(input_size, output_size)
@@ -164,7 +186,7 @@ if __name__ == '__main__':
         independent_linears=True
     )
   
-  debprint(rnn)
+  print(rnn)
 
   last_save_losses = []
 
@@ -172,13 +194,13 @@ if __name__ == '__main__':
  
 
   (chx, mhx, rv) = (None, None, None)
-  for epoch in range(iterations + 1):
+  for epoch in tqdm(range(iterations + 1)):
     llprint("\rIteration {ep}/{tot}".format(ep=epoch, tot=iterations))
     optimizer.zero_grad()
 
     random_length = np.random.randint(1, sequence_max_length + 1)
 
-    input_data, target_output = generate_data(batch_size, random_length, input_length, -1, maxnumberofcopies=maxnumberofcopies)
+    input_data, target_output = generate_data(batch_size, random_length, input_length, -1, maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=currentmaxnocopies)
 
     debprint(input_data.shape, target_output.shape)
 
@@ -212,12 +234,7 @@ if __name__ == '__main__':
 
     if summarize:
       loss = np.mean(last_save_losses)
-      # print(input_data)
-      # print("1111111111111111111111111111111111111111111111")
-      # print(target_output)
-      # print('2222222222222222222222222222222222222222222222')
-      # print(F.relu6(output))
-      llprint("\n\tAvg. Logistic Loss: %.4f\n" % (loss))
+      llprint("\n\tAvg. Loss: %.4f\n" % (loss))
       if np.isnan(loss):
         raise Exception('nan Loss')
 
@@ -225,11 +242,6 @@ if __name__ == '__main__':
       print(v.keys())
 
       loss = np.mean(last_save_losses)
-      # print(input_data)
-      # print("1111111111111111111111111111111111111111111111")
-      # print(target_output)
-      # print('2222222222222222222222222222222222222222222222')
-      # print(F.relu6(output))
       last_save_losses = []
 
       viz.heatmap(
@@ -265,6 +277,12 @@ if __name__ == '__main__':
             )
       )
 
+    if epoch != 0 and epoch % curriculumMaxNoCopies_freq == 0:
+      currentmaxnocopies = currentmaxnocopies + 1
+      if currentmaxnocopies > maxnumberofcopies:
+        currentmaxnocopies = maxnumberofcopies
+      print("Increasing max number of copies to " + str(currentmaxnocopies))
+
 
     if increment_curriculum:
       sequence_max_length = sequence_max_length + curriculum_increment
@@ -276,19 +294,42 @@ if __name__ == '__main__':
       cur_weights = rnn.state_dict()
       T.save(cur_weights, check_ptr)
       llprint("Done!\n")
+    
+    if summarize:
+      random_length = np.random.randint(2, sequence_max_length + 1)
+      input_data, target_output = generate_data(batch_size, random_length, input_length, -1, maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=currentmaxnocopies, fillbatch=True)
+
+      if rnn.debug:
+        output, (chx, mhx, rv), v = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
+      else:
+        output, (chx, mhx, rv) = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
+
+      print("\n\n")
+      print("Input: ", torch.flatten(input_data[0]))
+      print("Output: ", torch.flatten(torch.round(output[0], decimals=1)))
+      print("Target: ", torch.flatten(target_output[0]))
+      print("CE Loss: ", str(mse(output, target_output).item()))
+      print("Log Loss: ", str(criterion(output, target_output).item()))
+      print("\n\n")
 
   for i in range(10):#range(int((iterations + 1) / 100)):
     llprint("\nIteration %d/%d" % (i, iterations))
     # We test now the learned generalization using sequence_max_length examples
     random_length = np.random.randint(2, sequence_max_length + 1)
-    input_data, target_output = generate_data(100, random_length, input_length, -1, maxnumberofcopies=maxnumberofcopies)
+    input_data, target_output = generate_data(batch_size, random_length, input_length, -1, maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=maxnumberofcopies)
 
     if rnn.debug:
       output, (chx, mhx, rv), v = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
     else:
       output, (chx, mhx, rv) = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
 
-    print(torch.flatten(torch.round(output[0], decimals=0)), torch.flatten(target_output[0]))
+    print("\n\n")
+    print("Input: ", torch.flatten(input_data[0]))
+    print("Output: ", torch.flatten(torch.round(output[0], decimals=1)))
+    print("Target: ", torch.flatten(target_output[0]))
+    print("CE Loss: ", str(mse(output, target_output).item()))
+    print("Log Loss: ", str(criterion(output, target_output).item()))
+    print("\n\n")
     output = output[:, -1, :].sum().data.cpu().numpy()
     target_output = target_output.sum().data.cpu().numpy()
 
