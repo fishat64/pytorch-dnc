@@ -13,8 +13,12 @@ from torch.nn.utils.rnn import PackedSequence
 from .util import *
 from .memory import *
 
+from .lib import RETURNOTHEROBJ
+
 from torch.nn.init import orthogonal_, xavier_uniform_
 
+import random
+import copy
 
 class DNC(nn.Module):
 
@@ -37,7 +41,11 @@ class DNC(nn.Module):
       independent_linears=False,
       share_memory=True,
       debug=False,
-      clip=20
+      clip=20,
+      output_size=None,
+      evaloutputformat=T.int64,
+      returnOther=RETURNOTHEROBJ,
+      address_every_slot=False
   ):
     super(DNC, self).__init__()
     # todo: separate weights and RNNs for the interface and output vectors
@@ -60,6 +68,7 @@ class DNC(nn.Module):
     self.share_memory = share_memory
     self.debug = debug
     self.clip = clip
+    self.address_every_slot = address_every_slot
 
     self.w = self.cell_size
     self.r = self.read_heads
@@ -67,11 +76,17 @@ class DNC(nn.Module):
     self.read_vectors_size = self.r * self.w
     self.output_size = self.hidden_size
 
+
     self.nn_input_size = self.input_size + self.read_vectors_size
     self.nn_output_size = self.output_size + self.read_vectors_size
 
     self.rnns = []
     self.memories = []
+
+    
+
+    self.returnOther = returnOther
+
 
     for layer in range(self.num_layers):
       if self.rnn_type.lower() == 'rnn':
@@ -80,9 +95,10 @@ class DNC(nn.Module):
       elif self.rnn_type.lower() == 'gru':
         self.rnns.append(nn.GRU((self.nn_input_size if layer == 0 else self.nn_output_size),
                                 self.output_size, bias=self.bias, batch_first=True, dropout=self.dropout, num_layers=self.num_hidden_layers))
-      if self.rnn_type.lower() == 'lstm':
+      elif self.rnn_type.lower() == 'lstm':
         self.rnns.append(nn.LSTM((self.nn_input_size if layer == 0 else self.nn_output_size),
                                  self.output_size, bias=self.bias, batch_first=True, dropout=self.dropout, num_layers=self.num_hidden_layers))
+      
       setattr(self, self.rnn_type.lower() + '_layer_' + str(layer), self.rnns[layer])
 
       # memories for each layer
@@ -94,7 +110,8 @@ class DNC(nn.Module):
                 cell_size=self.w,
                 read_heads=self.r,
                 gpu_id=self.gpu_id,
-                independent_linears=self.independent_linears
+                independent_linears=self.independent_linears,
+                address_every_slot=self.address_every_slot
             )
         )
         setattr(self, 'rnn_layer_memory_' + str(layer), self.memories[layer])
@@ -108,14 +125,17 @@ class DNC(nn.Module):
               cell_size=self.w,
               read_heads=self.r,
               gpu_id=self.gpu_id,
-              independent_linears=self.independent_linears
+              independent_linears=self.independent_linears,
+              address_every_slot=self.address_every_slot
           )
       )
       setattr(self, 'rnn_layer_memory_shared', self.memories[0])
 
     # final output layer
-    self.output = nn.Linear(self.nn_output_size, self.input_size)
+    self.output = nn.Linear(self.nn_output_size, self.input_size if output_size is None else output_size)
     orthogonal_(self.output.weight)
+
+    self.evaloutput = lambda inputtensor: T.round(inputtensor).to(evaloutputformat)
 
     if self.gpu_id != -1:
       [x.cuda(self.gpu_id) for x in self.rnns]
@@ -164,15 +184,15 @@ class DNC(nn.Module):
           'usage_vector': [],
       }
 
-    debug_obj['memory'].append(mhx['memory'][0].data.cpu().numpy())
-    debug_obj['link_matrix'].append(mhx['link_matrix'][0][0].data.cpu().numpy())
-    debug_obj['precedence'].append(mhx['precedence'][0].data.cpu().numpy())
-    debug_obj['read_weights'].append(mhx['read_weights'][0].data.cpu().numpy())
-    debug_obj['write_weights'].append(mhx['write_weights'][0].data.cpu().numpy())
-    debug_obj['usage_vector'].append(mhx['usage_vector'][0].unsqueeze(0).data.cpu().numpy())
+    debug_obj['memory'].append(mhx['memory'][0].data.cpu().detach().numpy())
+    debug_obj['link_matrix'].append(mhx['link_matrix'][0][0].data.cpu().detach().numpy())
+    debug_obj['precedence'].append(mhx['precedence'][0].data.cpu().detach().numpy())
+    debug_obj['read_weights'].append(mhx['read_weights'][0].data.cpu().detach().numpy())
+    debug_obj['write_weights'].append(mhx['write_weights'][0].data.cpu().detach().numpy())
+    debug_obj['usage_vector'].append(mhx['usage_vector'][0].unsqueeze(0).data.cpu().detach().numpy())
     return debug_obj
 
-  def _layer_forward(self, input, layer, hx=(None, None), pass_through_memory=True):
+  def _layer_forward(self, input, layer, hx=(None, None), pass_through_memory=True, stepByStep=False, mytime=None, mylayer=None):
     (chx, mhx) = hx
 
     # pass through the controller layer
@@ -191,18 +211,24 @@ class DNC(nn.Module):
     # pass through memory
     if pass_through_memory:
       if self.share_memory:
-        read_vecs, mhx = self.memories[0](ξ, mhx)
+        read_vecs, mhx, returnOtherNew = self.memories[0](ξ, mhx, stepByStep=stepByStep, returnOther=self.returnOther, mytime=mytime, mylayer=mylayer) # Memory.forward()
       else:
-        read_vecs, mhx = self.memories[layer](ξ, mhx)
+        read_vecs, mhx, returnOtherNew = self.memories[layer](ξ, mhx, stepByStep=stepByStep, returnOther=self.returnOther, mytime=mytime, mylayer=mylayer) # Memory.forward()
       # the read vectors
       read_vectors = read_vecs.view(-1, self.w * self.r)
+      self.returnOther = returnOtherNew
     else:
       read_vectors = None
 
     return output, (chx, mhx, read_vectors)
 
-  def forward(self, input, hx=(None, None, None), reset_experience=False, pass_through_memory=True):
-    # handle packed data
+  def forward(self, input, hx=(None, None, None), reset_experience=False, pass_through_memory=True, stepByStep=False, retOther=False):
+    for key1, key2 in self.returnOther["keycombs"]:
+      self.returnOther[key2] = []
+
+    #print(self.returnOther)
+
+
     is_packed = type(input) is PackedSequence
     if is_packed:
       input, lengths = pad(input)
@@ -229,16 +255,35 @@ class DNC(nn.Module):
     outs = [None] * max_length
     read_vectors = None
 
+    #print("max_length", max_length)
+    #print("num_layers", self.num_layers)
+
     # pass through time
-    for time in range(max_length):
+    for time in range(max_length): # input_size
       # pass thorugh layers
       for layer in range(self.num_layers):
+        if stepByStep != False:
+          stepByStep["time"] = time
+          stepByStep["layer"] = layer
+          stepByStep["objects"].append(copy.deepcopy(stepByStep["currentObj"]))
+          stepByStep["currentObj"] = copy.deepcopy(stepByStep["defObj"])
+          stepByStep["currentObj"]["i"] = stepByStep["CurrI"]
+          stepByStep["currentObj"]["time"] = time
+          stepByStep["currentObj"]["layer"] = layer 
         # this layer's hidden states
         chx = controller_hidden[layer]
         m = mem_hidden if self.share_memory else mem_hidden[layer]
         # pass through controller
         outs[time], (chx, m, read_vectors) = \
-          self._layer_forward(inputs[time], layer, (chx, m), pass_through_memory)
+          self._layer_forward(inputs[time], layer, (chx, m), pass_through_memory, stepByStep=stepByStep, mytime=time, mylayer=layer)
+
+        if stepByStep != False:
+          stepByStep["currentObj"]["inputs"] = inputs[time].detach().numpy()
+          stepByStep["currentObj"]["outputs"] = outs[time].detach().numpy()
+          stepByStep["currentObj"]["chx"] = tuple([it.detach().numpy() for it in chx])
+          stepByStep["currentObj"]["m"] = dict([(k, v.detach().numpy()) for k, v in m.items() if isinstance(v, T.Tensor)])
+          stepByStep["currentObj"]["read_vectors"] = read_vectors.detach().numpy()
+          
 
         # debug memory
         if self.debug:
@@ -258,6 +303,9 @@ class DNC(nn.Module):
           outs[time] = T.cat([outs[time], last_read], 1)
         inputs[time] = outs[time]
 
+        if stepByStep != False:
+          stepByStep["currentObj"]["total_o"] = outs[time].detach().numpy()
+
     if self.debug:
       viz = {k: np.array(v) for k, v in viz.items()}
       viz = {k: v.reshape(v.shape[0], v.shape[1] * v.shape[2]) for k, v in viz.items()}
@@ -269,6 +317,23 @@ class DNC(nn.Module):
     if is_packed:
       outputs = pack(output, lengths)
 
+    if not self.training:
+      outputs = self.evaloutput(outputs)
+
+
+    if retOther:
+      for key1, key2 in self.returnOther["keycombs"]:
+        #print(key1, key2, self.returnOther[key1], len(self.returnOther[key2]))
+        if self.returnOther[key1] and len(self.returnOther[key2]) > 0:
+          self.returnOther[key2] = T.stack(self.returnOther[key2], dim=1 if self.batch_first else 0)
+          #print(isinstance(self.returnOther[key2], T.Tensor))
+
+      #print(self.returnOther)
+      
+      if self.debug:
+        return outputs, (controller_hidden, mem_hidden, read_vectors), viz, self.returnOther
+      else:
+        return outputs, (controller_hidden, mem_hidden, read_vectors), self.returnOther
     if self.debug:
       return outputs, (controller_hidden, mem_hidden, read_vectors), viz
     else:

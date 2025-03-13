@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import random
+from uuid import uuid4
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -14,6 +16,9 @@ import argparse
 from visdom import Visdom
 
 from tqdm import tqdm
+
+import pandas as pd
+import plotly.graph_objects as go
 
 sys.path.insert(0, os.path.join('..', '..'))
 
@@ -67,7 +72,6 @@ print(args)
 
 st = InputStorage()
 
-
 viz = Visdom()
 # assert viz.check_connection()
 
@@ -88,7 +92,7 @@ def debprint(*args):
     print(*args)
 
 
-def generate_data(batch_size, length, size, cuda=-1, maxnumberofcopies=3, currentmaxnocopies=3, fillbatch=False):
+def generate_data(batch_size, length, maxnumberofcopies=3, currentmaxnocopies=3, testoccurance=True):
   length=length+1
   size=1 # ignore size
   
@@ -100,42 +104,41 @@ def generate_data(batch_size, length, size, cuda=-1, maxnumberofcopies=3, curren
 
   sequence = np.random.binomial(1, 0.5, (batch_size, length-1, size))
 
+
+
+  print(batch_size, length, size, maxnumberofcopies, currentmaxnocopies)
+
+  finputdata = np.zeros((batch_size, length*maxnumberofcopies, size))
+  finputdata[:, :length-1, :] = sequence
+  finputdata[:, length-1, :] = ENDSYM  # the end symbol
+  finputdata[:, -2, :] = ENDSYM
+  finputdata[:, -1, :] = numberOfCopies  # the end symbol
+
   for i in range(batch_size): # assure no empty sequences
-    while np.sum(sequence[i]) == 0:
+    while np.sum(sequence[i]) == 0 or (testoccurance and st.isSaved(finputdata[i], flag="testData")):
       sequence[i] = np.random.binomial(1, 0.5, (1, length-1, size))
-
-  if fillbatch:
-    seq = np.random.binomial(1, 0.5, (1, length-1, size))
-    while np.sum(seq) == 0:
-      seq = np.random.binomial(1, 0.5, (1, length-1, size))
-    noc =  np.random.randint(low=2, high=currentmaxnocopies)
-    for i in range(batch_size):
-      sequence[i] = seq
-      numberOfCopies[i] = noc
-
-
-
+    
   input_data[:, :length-1, :] = sequence
-  input_data[:, length-1, :] = 9  # the end symbol
-  input_data[:, -2, :] = 9
+  input_data[:, length-1, :] = ENDSYM  # the end symbol
+  input_data[:, -2, :] = ENDSYM
   input_data[:, -1, :] = numberOfCopies  # the end symbol
 
   for i in range(batch_size): # save input data to avoid intersection between train, test and validation data
-    st.saveInput(input_data[i])
-
     for j in range(numberOfCopies[i][0]):
       target_output[i, (j*length)-j:((j+1)*length) - (j+1), :] = sequence[i]
 
   debprint("inputdata:", input_data.shape)
   debprint("outpudtata:",target_output.shape)
 
-  input_data = T.from_numpy(input_data)
-  target_output = T.from_numpy(target_output)
-  if cuda != -1:
-    input_data = input_data.cuda()
-    target_output = target_output.cuda()
 
-  return var(input_data), var(target_output)
+  return input_data, target_output 
+
+
+def combLoss(output, target):
+  return mse(output, target)
+
+def incrementCurriculum(trainError, epoch, sequence_length, maxsequence_length, curriculum_fre):
+  return epoch != 0 and sequence_length < maxsequence_length and epoch % curriculum_fre == 0
 
 
 if __name__ == '__main__':
@@ -145,9 +148,13 @@ if __name__ == '__main__':
   if not os.path.isdir(ckpts_dir):
     os.mkdir(ckpts_dir)
 
-  batch_size = 100
-  sequence_max_length = 3
-  iterations = 20000
+  datas = []
+
+  name = 'mc_ ' + str(uuid4().hex)[:3] + ': \n'
+
+  batch_size = 1
+  sequence_max_length = 4
+  iterations = 200000
   summarize_freq = 100
   check_freq = 100
   curriculum_freq = 5000
@@ -158,10 +165,9 @@ if __name__ == '__main__':
   mem_slot = 16 # number of memory slots
   mem_size = 1 # size of each memory slot
   read_heads = 1
-  curriculum_increment = 1
 
 
-  maxnumberofcopies=6
+  maxnumberofcopies=7
   currentmaxnocopies=3
 
   input_length = 6
@@ -191,31 +197,76 @@ if __name__ == '__main__':
   last_save_losses = []
 
   optimizer = optim.Adam(rnn.parameters(), lr=0.001, eps=1e-9, betas=[0.9, 0.98]) # 0.0001
- 
+
+  print(sequence_max_length)
+
+  for i in range(1, sequence_max_length+1):
+    inputdataspace = 2**i*maxnumberofcopies # i bit numbers amd up to maxnumberofcopies
+    testdatasize = int(inputdataspace*0.1)+1 # at least 1
+    input_data, target_output = generate_data(testdatasize, i, maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=maxnumberofcopies, testoccurance=False)
+
+    for i in range(testdatasize):
+      st.saveInput(input_data[i], output=target_output[i], withoutIncrement=True, flag="testData") 
+
+
 
   (chx, mhx, rv) = (None, None, None)
+  Testloss = 0
   for epoch in tqdm(range(iterations + 1)):
     llprint("\rIteration {ep}/{tot}".format(ep=epoch, tot=iterations))
     optimizer.zero_grad()
 
     random_length = np.random.randint(1, sequence_max_length + 1)
-
-    input_data, target_output = generate_data(batch_size, random_length, input_length, -1, maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=currentmaxnocopies)
-
-    debprint(input_data.shape, target_output.shape)
+    input_data, target_output = generate_data(batch_size, random_length, maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=currentmaxnocopies)
+    input_data = var(T.from_numpy(input_data))
+    target_output = var(T.from_numpy(target_output)) 
+    # generate test data
 
     if rnn.debug:
       output, (chx, mhx, rv), v = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
     else:
       output, (chx, mhx, rv) = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
 
-    debprint(output.shape, target_output.shape)
 
-    debprint("input_data:", input_data[0, :, :].T)
-    debprint("target_output:", target_output[0, :, :].T)
-    debprint("output:", output[0, :, :].T)
+    loss = combLoss((output), target_output)
 
-    loss = criterion((output), target_output)
+    if epoch % 100 == 0: # calculate test loss
+      testset = st.getDataByFlag("testData") # get test data
+      testlosses = []
+
+      for k in range(int(len(testset) / batch_size)+1): # split to batches
+        input_TEST_data = np.zeros((batch_size, (sequence_max_length+1)*maxnumberofcopies, 1), dtype=np.float32)
+        target_TEST_output = np.zeros((batch_size, (sequence_max_length+1)*maxnumberofcopies, 1), dtype=np.float32)
+        for i in range(batch_size):
+          if i + k * batch_size < len(testset):
+            sh1 = testset[k*batch_size+i]["input"].shape[0]
+            sh2 = testset[k*batch_size+i]["output"].shape[0]
+            input_TEST_data[i,:sh1] = testset[k*batch_size+i]["input"]
+            target_TEST_output[i,:sh2] = testset[k*batch_size+i]["output"]
+          else: # fill batch with random elements
+            rel = random.choice(testset)
+            sh1 = rel["input"].shape[0]
+            sh2 = rel["output"].shape[0]
+            input_TEST_data[i, :sh1] = rel["input"]
+            target_TEST_output[i, :sh1] = rel["output"]
+        input_TEST_data = var(T.from_numpy(input_TEST_data))
+        target_TEST_output = var(T.from_numpy(target_TEST_output))
+
+        TEST_output = np.zeros(target_TEST_output.shape)
+        if rnn.debug:
+          eTEST_output, _, _ = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
+        else:
+          eTEST_output, _ = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
+
+        TEST_output[:eTEST_output.shape[0], :eTEST_output.shape[1], :eTEST_output.shape[2]] = eTEST_output.data.cpu().numpy()
+        TEST_output = var(T.from_numpy(TEST_output))
+        MyTestloss = combLoss((TEST_output), target_TEST_output).item() # calculate test loss
+        testlosses.append(MyTestloss)
+      Testloss = np.mean(testlosses) # calculate average
+
+    datas.append({"epoch": epoch, "loss": loss.item(), "testloss": Testloss, "sequencelength": input_length})
+
+
 
     loss.backward()
 
@@ -225,7 +276,7 @@ if __name__ == '__main__':
 
     summarize = (epoch % summarize_freq == 0)
     take_checkpoint = (epoch != 0) and (epoch % check_freq == 0)
-    increment_curriculum = (epoch != 0) and (epoch % curriculum_freq == 0)
+    
 
     # detach memory from graph
     mhx = { k : (v.detach() if isinstance(v, var) else v) for k, v in mhx.items() }
@@ -249,7 +300,7 @@ if __name__ == '__main__':
             opts=dict(
                 xtickstep=10,
                 ytickstep=2,
-                title='Memory, t: ' + str(epoch) + ', loss: ' + str(loss),
+                title=name + 'Memory, t: ' + str(epoch) + ', loss: ' + str(loss),
                 ylabel='layer * time',
                 xlabel='mem_slot * mem_size'
             )
@@ -260,7 +311,7 @@ if __name__ == '__main__':
             opts=dict(
                 xtickstep=10,
                 ytickstep=2,
-                title='Link Matrix, t: ' + str(epoch) + ', loss: ' + str(loss),
+                title=name + 'Link Matrix, t: ' + str(epoch) + ', loss: ' + str(loss),
                 ylabel='mem_slot',
                 xlabel='mem_slot'
             )
@@ -271,21 +322,21 @@ if __name__ == '__main__':
             opts=dict(
                 xtickstep=10,
                 ytickstep=2,
-                title='Precedence, t: ' + str(epoch) + ', loss: ' + str(loss),
+                title=name + 'Precedence, t: ' + str(epoch) + ', loss: ' + str(loss),
                 ylabel='layer * time',
                 xlabel='mem_slot'
             )
       )
 
-    if epoch != 0 and epoch % curriculumMaxNoCopies_freq == 0:
+    if incrementCurriculum(loss, epoch, currentmaxnocopies, maxnumberofcopies, curriculumMaxNoCopies_freq):
       currentmaxnocopies = currentmaxnocopies + 1
       if currentmaxnocopies > maxnumberofcopies:
         currentmaxnocopies = maxnumberofcopies
       print("Increasing max number of copies to " + str(currentmaxnocopies))
 
 
-    if increment_curriculum:
-      sequence_max_length = sequence_max_length + curriculum_increment
+    if incrementCurriculum(loss, epoch, sequence_max_length, sequence_max_length + 1, curriculum_freq):
+      sequence_max_length = sequence_max_length + 1
       print("Increasing max length to " + str(sequence_max_length))
 
     if take_checkpoint:
@@ -297,7 +348,10 @@ if __name__ == '__main__':
     
     if summarize:
       random_length = np.random.randint(2, sequence_max_length + 1)
-      input_data, target_output = generate_data(batch_size, random_length, input_length, -1, maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=currentmaxnocopies, fillbatch=True)
+      input_data, target_output = generate_data(batch_size, random_length,  maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=currentmaxnocopies)
+
+      input_data = var(T.from_numpy(input_data))
+      target_output = var(T.from_numpy(target_output))
 
       if rnn.debug:
         output, (chx, mhx, rv), v = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
@@ -308,16 +362,37 @@ if __name__ == '__main__':
       print("Input: ", torch.flatten(input_data[0]))
       print("Output: ", torch.flatten(torch.round(output[0], decimals=1)))
       print("Target: ", torch.flatten(target_output[0]))
-      print("CE Loss: ", str(mse(output, target_output).item()))
-      print("Log Loss: ", str(criterion(output, target_output).item()))
+      print("MSE Loss: ", str(mse(output, target_output).item()))
+      print("CE Loss: ", str(criterion(output, target_output).item()))
+      print("EXP Loss: ", str(exp_loss(output, target_output).item()))
       print("\n\n")
+
+  df = pd.DataFrame(datas)
+  fig = go.Figure()
+  fig.add_trace(go.Scatter(x=df["epoch"], y=df["loss"], mode='lines', name='Train Data'))
+  fig.add_trace(go.Scatter(x=df["epoch"], y=df["testloss"], mode='lines', name='Test Data'))
+  fig.update_layout(title='Losses', xaxis_title='Epoch', yaxis_title='Loss')
+  fig.show()
+
+
+  input_data, target_output = generate_data(1, random_length, maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=maxnumberofcopies)
+
+  input_data = var(T.from_numpy(input_data))
+  target_output = var(T.from_numpy(target_output))
+  print(input_data)
+  print(target_output)
+  output, (chx, mhx, rv), v = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True, stepByStep=True)
+
+
 
   for i in range(10):#range(int((iterations + 1) / 100)):
     llprint("\nIteration %d/%d" % (i, iterations))
     # We test now the learned generalization using sequence_max_length examples
     random_length = np.random.randint(2, sequence_max_length + 1)
-    input_data, target_output = generate_data(batch_size, random_length, input_length, -1, maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=maxnumberofcopies)
+    input_data, target_output = generate_data(batch_size, random_length, maxnumberofcopies=maxnumberofcopies, currentmaxnocopies=maxnumberofcopies)
 
+    input_data = var(T.from_numpy(input_data))
+    target_output = var(T.from_numpy(target_output))
     if rnn.debug:
       output, (chx, mhx, rv), v = rnn(input_data, (None, mhx, None), reset_experience=True, pass_through_memory=True)
     else:
@@ -327,8 +402,9 @@ if __name__ == '__main__':
     print("Input: ", torch.flatten(input_data[0]))
     print("Output: ", torch.flatten(torch.round(output[0], decimals=1)))
     print("Target: ", torch.flatten(target_output[0]))
-    print("CE Loss: ", str(mse(output, target_output).item()))
-    print("Log Loss: ", str(criterion(output, target_output).item()))
+    print("MSE Loss: ", str(mse(output, target_output).item()))
+    print("CE Loss: ", str(criterion(output, target_output).item()))
+    print("EXP Loss: ", str(exp_loss(output, target_output).item()))
     print("\n\n")
     output = output[:, -1, :].sum().data.cpu().numpy()
     target_output = target_output.sum().data.cpu().numpy()

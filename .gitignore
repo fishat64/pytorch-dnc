@@ -20,3 +20,7 @@ dist/
 dnc.egg-info/
 tasks/checkpoints/
 faiss/
+add_*
+add_*/
+tasks/old/
+tasks/checkpoints/
